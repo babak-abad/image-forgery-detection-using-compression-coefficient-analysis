@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from config import WEIGHTS_DIR
+from config import PATCH_VOTE_THRESHOLD, WEIGHTS_DIR
 from build_dataset import process_image
 
 
@@ -84,7 +84,7 @@ def predict_image(img_path):
         logit = model(x.unsqueeze(0))
         p_double = torch.sigmoid(logit).item()
 
-    pred = 1 if p_double >= 0.5 else 0
+    pred = 1 if p_double >= PATCH_VOTE_THRESHOLD else 0
     proba = np.array([1.0 - p_double, p_double], dtype=np.float32)
 
     label = "single-compressed" if pred == 0 else "double-compressed"
