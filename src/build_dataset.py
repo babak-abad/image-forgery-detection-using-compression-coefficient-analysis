@@ -24,6 +24,26 @@ from quant_tables import get_quant_table
 HIST_LO = -50.0
 HIST_HI = 50.0
 
+# Lazily-built albumentations rotation transform (see _rotate_random_90).
+_ROTATE_90 = None
+
+
+def _rotate_random_90(img):
+    """Rotate a 2D grayscale image by a random multiple of 90 degrees.
+
+    Uses albumentations RandomRotate90, a lossless pixel permutation
+    (np.rot90 under the hood), so no interpolation is introduced and the
+    8x8 DCT block grid stays aligned with the image. albumentations is
+    imported lazily so inference-only callers (predict.py) never load it
+    or its dependencies.
+    """
+    global _ROTATE_90
+    if _ROTATE_90 is None:
+        import albumentations as A
+        _ROTATE_90 = A.RandomRotate90()
+    rotated = _ROTATE_90(image=img[:, :, np.newaxis])["image"]
+    return rotated[:, :, 0]
+
 
 def _histograms_numpy(ac, lo, hi, n_bins, out):
     """Compute per-position density histograms for AC coefficients.
@@ -93,12 +113,19 @@ def extract_hist_features(blocks, qf):
     return out.reshape(-1)
 
 
-def process_image(img_path, label, qf, qf2=None):
+def process_image(img_path, label, qf, qf2=None, rotate=False):
     """Load an image, produce a compressed version (single or double),
     and return its feature vector.
 
     `label` is accepted for API compatibility but unused (labels are assigned
     by the caller).
+
+    When `rotate` is True, a random 90-degree-multiple rotation (albumentations
+    RandomRotate90) is applied to the loaded image before cropping and DCT
+    analysis. Training-time augmentation only; inference callers (predict.py,
+    main.py) keep the default False. Each call draws an independent rotation,
+    so the single and double samples of one image may end up differently
+    rotated (each remains a valid sample of a rotated source image).
 
     Compression handling depends on the input format:
       * JPEG inputs (`.jpg`/`.jpeg`, any case) are ALREADY single-compressed
@@ -110,9 +137,13 @@ def process_image(img_path, label, qf, qf2=None):
         compression (`qf`) is applied (single), and the second (`qf2`) is
         applied on top (double), as before.
     """
-    # Load grayscale (Y channel) and crop to a multiple of BLOCK_SIZE.
+    # Load grayscale (Y channel), optionally rotate (lossless 90-degree
+    # multiples; a 90-degree turn swaps H and W so the crop runs AFTER the
+    # rotation), and crop to a multiple of BLOCK_SIZE.
     img = Image.open(img_path).convert('L')
     img = np.array(img)
+    if rotate:
+        img = _rotate_random_90(img)
     h, w = img.shape
     h = h - (h % BLOCK_SIZE)
     w = w - (w % BLOCK_SIZE)

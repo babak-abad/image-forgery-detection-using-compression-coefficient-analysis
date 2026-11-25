@@ -47,6 +47,7 @@ from config import (
     MLP_NUM_EPOCHS,
     MLP_EARLY_STOPPING,
     MLP_PATIENCE,
+    ROTATION_AUGMENT,
 )
 from build_dataset import process_image
 
@@ -58,12 +59,18 @@ def _process_one_image(path):
 
     QF_FIRST and QF_SECOND are [min, max] ranges; a random quality factor is
     drawn from each range per image to diversify double-compression artifacts.
+    When ROTATION_AUGMENT is True, each sample additionally receives an
+    independent random 90-degree-multiple rotation (albumentations).
     """
     try:
-        feats_single = process_image(path, label=0, qf=QF_SINGLE)
+        feats_single = process_image(
+            path, label=0, qf=QF_SINGLE, rotate=ROTATION_AUGMENT
+        )
         qf_first = random.randint(QF_FIRST[0], QF_FIRST[1])
         qf_second = random.randint(QF_SECOND[0], QF_SECOND[1])
-        feats_double = process_image(path, label=1, qf=qf_first, qf2=qf_second)
+        feats_double = process_image(
+            path, label=1, qf=qf_first, qf2=qf_second, rotate=ROTATION_AUGMENT
+        )
         return feats_single, 0, feats_double, 1
     except Exception as exc:  # skip unreadable / corrupt images
         print(f"  skipping {path}: {exc}")
@@ -449,6 +456,12 @@ def extract_features(img_paths, return_paths=False):
     holding the source image path of each row (added for main.py's patch-based
     image evaluation, which must map validation rows back to source files).
     """
+    if ROTATION_AUGMENT:
+        print(
+            "Rotation augmentation: ON "
+            "(random 90-degree multiples via albumentations)"
+        )
+
     X, y, paths = [], [], []
 
     if NUM_FEATURE_WORKERS and NUM_FEATURE_WORKERS > 1:

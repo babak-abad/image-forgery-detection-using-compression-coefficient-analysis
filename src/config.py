@@ -46,6 +46,19 @@ QF_FIRST = [50, 95]
 QF_SECOND = [50, 95]
 
 # ----------------------------------------------------------------------------
+# Rotation augmentation (albumentations)
+# ----------------------------------------------------------------------------
+
+# Randomly rotate each source image by a multiple of 90 degrees (0/90/180/270)
+# during TRAINING feature extraction, using albumentations RandomRotate90.
+# 90-degree rotation is a pure pixel permutation (no interpolation), so the
+# 8x8 DCT block grid stays aligned and the double-compression comb pattern in
+# the AC-coefficient histograms is fully preserved. Applied once per sample
+# at feature-extraction time; predict.py / main.py never rotate.
+# Range: boolean True / False. Current: True.
+ROTATION_AUGMENT = True
+
+# ----------------------------------------------------------------------------
 # DCT / histogram settings
 # ----------------------------------------------------------------------------
 

@@ -33,8 +33,11 @@ Any folder of ordinary images works as well. Training discovers
 per image: a single-compressed copy (quality `QF_SINGLE` = 90) and a double-compressed
 copy (two quality factors drawn per image from the `QF_FIRST`/`QF_SECOND` ranges). JPEG
 inputs keep their original first compression; non-JPEG inputs get a fully simulated one.
-`MAX_IMAGES` caps the run for quick experiments (0 = all images). Distributed for
-non-commercial research use only.
+`MAX_IMAGES` caps the run for quick experiments (0 = all images). As augmentation,
+each sample is additionally rotated by a random multiple of 90° — a lossless pixel
+permutation (albumentations `RandomRotate90`) that keeps the 8×8 DCT grid and the
+comb pattern intact; toggle it with `ROTATION_AUGMENT` in `src/config.py`.
+Distributed for non-commercial research use only.
 
 ## Run
 
@@ -57,7 +60,7 @@ factors, histogram bins, MLP shape, patch voting — live in `src/config.py`.
 
 ## Layout
 
-- `src/config.py` — all tunable settings (paths, quality factors, histogram, training, patch voting)
+- `src/config.py` — all tunable settings (paths, quality factors, rotation augmentation, histogram, training, patch voting)
 - `src/dct_utils.py` — vectorised 8×8 block-wise 2-D DCT/IDCT and quantisation helpers
 - `src/quant_tables.py` — standard JPEG luminance quantisation table scaled by quality factor
 - `src/build_dataset.py` — single/double JPEG compression simulation and AC-histogram feature extraction

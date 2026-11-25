@@ -52,10 +52,20 @@ images and histogram figures generated from its photos are derivative works.
    console output.
    https://github.com/tartley/colorama
 
+10. **Albumentations** — A. Buslaev, A. Iglovikov, E. Khvedchenya, V. Parinov,
+    M. Druzhinin, A. A. Kalinin, *Albumentations: Fast and Flexible Image
+    Augmentations*, Information 11(2):125, 2020. MIT license. Provides the
+    `RandomRotate90` training-time rotation augmentation (lossless 90-degree
+    multiples that keep the 8×8 DCT grid aligned).
+    https://albumentations.ai
+
 Supporting libraries (transitive dependencies of the above, all permissively licensed):
-contourpy (BSD-3-Clause), cycler (BSD-3-Clause), fonttools (MIT), kiwisolver
-(BSD-3-Clause), narwhals (MIT), packaging (Apache-2.0 or BSD-2-Clause), pyparsing (MIT),
-python-dateutil (Apache-2.0 or BSD-3-Clause), six (MIT), threadpoolctl (BSD-3-Clause).
+albucore (MIT), annotated-types (MIT), contourpy (BSD-3-Clause), cycler (BSD-3-Clause),
+fonttools (MIT), kiwisolver (BSD-3-Clause), narwhals (MIT), opencv-python-headless
+(Apache-2.0), packaging (Apache-2.0 or BSD-2-Clause), pydantic (MIT), pydantic-core
+(MIT), pyparsing (MIT), PyYAML (MIT), python-dateutil (Apache-2.0 or BSD-2-Clause),
+simsimd (Apache-2.0), six (MIT), stringzilla (Apache-2.0), threadpoolctl
+(BSD-3-Clause), typing-inspection (MIT).
 
 All code libraries above are cleared for commercial use under their permissive licenses;
 the only non-commercial item in this project is the LV-MHP v1.0 dataset (entry 1), whose
