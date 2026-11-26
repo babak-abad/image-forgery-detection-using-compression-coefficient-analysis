@@ -92,7 +92,12 @@ RANDOM_STATE = 42
 # Sizes of the hidden layers in the MLP classifier.
 # Range: tuple of positive integers (or () for no hidden layer).
 # Typical values: (64,), (128, 64), (256, 128, 64). Current: (128, 64).
-MLP_HIDDEN_LAYERS = (128, 64)
+MLP_HIDDEN_LAYERS = (512, 256, 64)
+
+# Dropout probability applied after every hidden ReLU in the MLP.
+# Range: float 0.0-0.5. Current: 0.3 (regularizes the 512/256/64 net; the
+# plain (128, 64) net hit its best val_loss at epoch 5 and overfit after).
+MLP_DROPOUT = 0.3
 
 # Mini-batch size used by the PyTorch DataLoader during training.
 # iterations_per_epoch = ceil(n_train_samples / BATCH_SIZE). There is NO global
@@ -106,7 +111,7 @@ BATCH_SIZE = 1024
 # of time so the GPU is never starved waiting on data transfer.
 # Range: non-negative integer. 0 = load in the main process. Typical: 2, 4, 8.
 # Note: on Windows values >0 use process spawning; 2 is a safe default.
-NUM_WORKERS = 16
+NUM_WORKERS = 4
 
 # Number of parallel worker processes used for feature extraction in
 # train_model.py (ProcessPoolExecutor). Each worker processes whole images
@@ -150,3 +155,75 @@ PATCH_VOTE_THRESHOLD = 0.5
 # plotted to show the double-compression "comb pattern".
 # Range: 1..(BLOCK_SIZE**2 - 1). Typical: 1 (the (0,1) coefficient). Current: 1.
 HIST_COEFF_IDX = 1
+
+
+# ----------------------------------------------------------------------------
+# Multi-source dataset pools (dataset_sources.py / train_model.py)
+# ----------------------------------------------------------------------------
+
+# Folders whose images have NEVER been JPEG-compressed (BMP/PNG/TIFF).
+# Used to synthesize BOTH classes: uncompressed patches and 1-pass encodes are
+# label 0; 2- or 3-pass chains are label 1. Searched recursively.
+NO_COMPRESS_FOLDERS = [
+    "D:/projects/datasets/double compress checking/bmp_sources/archive_org",
+    "G:/rec/rec"
+]
+
+# Folders of already SINGLE-compressed JPEGs. Used directly as label-0
+# samples AND re-encoded (1-2 extra rounds at a fresh random quality, forced
+# to differ from the source file's estimated quality) to derive label-1
+# (double/triple) samples.
+# VISION "nat" pool: native camera JPEGs of 35 phone models, exactly one
+# prior compression (k = 1). Fetched by src/download_vision.py.
+SINGLE_COMPRESS_FOLDERS = [
+    "D:/projects/datasets/double compress checking/vision/nat",
+    "D:/projects/Div/ai-existence-check/data/datasets/Photos_downloaded_by_AirDroid_2"
+]
+
+# Folders of already MULTI-compressed JPEGs (>= 2 rounds in their history).
+# Used AS-IS, label 1, no extra compression applied.
+# VISION "natWA" pool: WhatsApp re-encodes of the SAME photos as the nat pool
+# above — real-world double-compressed files (k >= 2). dataset_sources.py
+# groups a photo's nat/natWA twins into one split group so neither twin (nor
+# anything derived from them) can leak across train/val/test.
+MULTI_COMPRESS_FOLDERS = [
+    "D:/projects/datasets/double compress checking/vision/natWA"
+]
+
+# Inclusive range for the random JPEG quality of every simulated pass.
+COMPRESS_Q_RANGE = (30, 100)
+
+# Force consecutive simulated passes (and the first pass of a derived sample
+# vs the source file's estimated quality) to use distinct quality factors,
+# because re-compression at the SAME quality is nearly undetectable.
+FORCE_DISTINCT_Q = True
+
+# Probability that a generated multi-compressed sample receives one extra
+# pass (BMP chains: 3 passes instead of 2; derived: 2 passes instead of 1).
+TRIPLE_COMPRESS_PROB = 0.25
+
+# Side length (pixels, multiple of BLOCK_SIZE) of the random training patch.
+TRAIN_PATCH_SIZE = 256
+
+# Samples generated per never-compressed source image.
+SAMPLES_UNCOMPRESSED_PER_UNCOMPRESSED = 1
+SAMPLES_SINGLE_PER_UNCOMPRESSED = 2
+SAMPLES_DOUBLE_PER_UNCOMPRESSED = 3
+
+# Samples per already-compressed source image: originals as-is (label from
+# the folder type) plus, for single-compressed sources, derived doubles.
+SAMPLES_ORIGINAL_PER_COMPRESSED = 2
+SAMPLES_DOUBLE_PER_COMPRESSED = 2
+
+# Fraction of SOURCE IMAGES (groups) reserved for validation. TEST_SIZE above
+# is likewise interpreted at source-group level by the multi-source trainer:
+# all samples generated from one source image stay in the same split.
+VAL_SIZE = 0.1
+
+# Analysis quantisation applied BEFORE histogramming: None = raw DCT
+# coefficients (chosen by the scratch probe: linear-probe accuracy 0.722 raw
+# vs 0.625 quantised-at-75); an integer q = quantise with table(q).
+ANALYSIS_QF = None
+
+# Directory for generated reports (training_results.html).
+DOC_DIR = "doc"

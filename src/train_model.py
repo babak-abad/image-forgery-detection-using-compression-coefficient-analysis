@@ -1,13 +1,32 @@
 # train_model.py
-"""Train a PyTorch MLP for single-vs-double JPEG compression detection.
+"""Train the MLP for single- vs multi-compressed JPEG detection.
+
+Multi-source dataset (see dataset_sources.py):
+
+  NO_COMPRESS_FOLDERS     (k=0)   -> uncompressed / synthetic single / synthetic multi
+  SINGLE_COMPRESS_FOLDERS (k=1)   -> real single / derived multi (re-encoded)
+  MULTI_COMPRESS_FOLDERS  (k>=2)  -> real multi (as-is)
+
+A sample's label is 1 (multi-compressed) iff (source prior compressions +
+applied rounds) >= 2. Every simulated compression round is a REAL JPEG
+encode/decode at a fresh random quality from COMPRESS_Q_RANGE, consecutive
+rounds use distinct quality factors, and derived rounds avoid the source
+file's estimated quality.
+
+The train/val/test split is at SOURCE-IMAGE level (70/10/20 by default): all
+samples generated from one source image stay together, so no pixel content
+leaks across splits. Features are raw DCT AC histograms (ANALYSIS_QF = None);
+the scratch probe showed quantised-at-75 histograms lose separability
+(0.625 vs 0.722 linear-probe accuracy).
 
 There is NO "max iterations" knob: each epoch is a full pass over the training
-set in BATCH_SIZE mini-batches (iterations_per_epoch = ceil(n_train / BATCH_SIZE)),
-and training continues epoch-by-epoch up to MLP_NUM_EPOCHS, with early stopping
-(MLP_PATIENCE, counted in epochs) as the practical stop condition.
+set in BATCH_SIZE mini-batches, training runs up to MLP_NUM_EPOCHS with early
+stopping (MLP_PATIENCE, counted in epochs, monitored on validation loss).
 """
+import base64
 import os
-import random
+import time
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend; safe for headless script runs
@@ -20,7 +39,6 @@ colorama_init()
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -30,16 +48,14 @@ from sklearn.metrics import (
 )
 
 from config import (
-    DATA_DIR,
     ASSETS_DIR,
     WEIGHTS_DIR,
-    QF_SINGLE,
-    QF_FIRST,
-    QF_SECOND,
-    MAX_IMAGES,
+    DOC_DIR,
     TEST_SIZE,
+    VAL_SIZE,
     RANDOM_STATE,
     MLP_HIDDEN_LAYERS,
+    MLP_DROPOUT,
     BATCH_SIZE,
     NUM_WORKERS,
     NUM_FEATURE_WORKERS,
@@ -47,37 +63,16 @@ from config import (
     MLP_NUM_EPOCHS,
     MLP_EARLY_STOPPING,
     MLP_PATIENCE,
-    ROTATION_AUGMENT,
+    ANALYSIS_QF,
+    NO_COMPRESS_FOLDERS,
+    SINGLE_COMPRESS_FOLDERS,
+    MULTI_COMPRESS_FOLDERS,
+    COMPRESS_Q_RANGE,
+    FORCE_DISTINCT_Q,
+    TRIPLE_COMPRESS_PROB,
+    TRAIN_PATCH_SIZE,
 )
-from build_dataset import process_image
-
-
-def _process_one_image(path):
-    """Worker callable for ProcessPoolExecutor (must be module-level on Windows).
-
-    Returns ((feats_single, 0), (feats_double, 1)) or None on failure.
-
-    QF_FIRST and QF_SECOND are [min, max] ranges; a random quality factor is
-    drawn from each range per image to diversify double-compression artifacts.
-    When ROTATION_AUGMENT is True, each sample additionally receives an
-    independent random 90-degree-multiple rotation (albumentations).
-    """
-    try:
-        feats_single = process_image(
-            path, label=0, qf=QF_SINGLE, rotate=ROTATION_AUGMENT
-        )
-        qf_first = random.randint(QF_FIRST[0], QF_FIRST[1])
-        qf_second = random.randint(QF_SECOND[0], QF_SECOND[1])
-        feats_double = process_image(
-            path, label=1, qf=qf_first, qf2=qf_second, rotate=ROTATION_AUGMENT
-        )
-        return feats_single, 0, feats_double, 1
-    except Exception as exc:  # skip unreadable / corrupt images
-        print(f"  skipping {path}: {exc}")
-        return None
-
-# Image extensions accepted as dataset inputs
-IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+from dataset_sources import build_source_tasks, process_source
 
 # Reproducibility
 torch.manual_seed(RANDOM_STATE)
@@ -103,6 +98,7 @@ class MLP(nn.Module):
         for h in hidden_layers:
             layers.append(nn.Linear(prev, h))
             layers.append(nn.ReLU())
+            layers.append(nn.Dropout(MLP_DROPOUT))
             prev = h
         # Single logit output for BCEWithLogitsLoss (positive class = double)
         layers.append(nn.Linear(prev, 1))
@@ -110,25 +106,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
-
-
-def list_images(data_dir):
-    """Return all image paths directly under data_dir (no subfolders)."""
-    if not os.path.isdir(data_dir):
-        raise FileNotFoundError(
-            f"DATA_DIR does not exist: {data_dir}. "
-            "Update DATA_DIR in config.py to point at your image folder."
-        )
-    paths = [
-        os.path.join(data_dir, f)
-        for f in sorted(os.listdir(data_dir))
-        if f.lower().endswith(IMG_EXTS)
-    ]
-    if not paths:
-        raise FileNotFoundError(
-            f"No images ({', '.join(IMG_EXTS)}) found in DATA_DIR: {data_dir}"
-        )
-    return paths
 
 
 def save_all_graphs(assets_dir, loss_curve, val_scores, y_test, y_pred, y_proba,
@@ -211,6 +188,7 @@ def save_all_graphs(assets_dir, loss_curve, val_scores, y_test, y_pred, y_proba,
     plt.close()
 
 
+
 def _to_device_normalized(X_chunk, mean, std):
     """Normalize a CPU tensor and move it to DEVICE (async when CUDA)."""
     x = (X_chunk - mean) / std
@@ -267,7 +245,7 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
 
     iterations_per_epoch = ceil(n_train / BATCH_SIZE). There is no global
     iteration cap; the outer loop runs up to MLP_NUM_EPOCHS and stops early
-    (MLP_PATIENCE epochs without val-accuracy improvement) when
+    (MLP_PATIENCE epochs without val-loss improvement) when
     MLP_EARLY_STOPPING is True.
 
     Data stays on the CPU (normalized lazily per batch); worker processes
@@ -279,7 +257,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=MLP_LEARNING_RATE)
 
-    # Keep data on CPU; workers prefetch + pin_memory enables async H2D copy.
     ds = TensorDataset(X_tr, y_tr)
     loader = DataLoader(
         ds,
@@ -294,7 +271,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     n_epochs = MLP_NUM_EPOCHS
     has_val = X_val is not None
 
-    # Ultralytics-style column header
     header = f"{Fore.CYAN}{'Epoch':>10}  {'GPU_mem':>8}  {'train_loss':>12}"
     if has_val:
         header += f"  {'val_loss':>10}  {'val_acc':>8}  {'precision':>10}  {'recall':>8}"
@@ -305,7 +281,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
         f"{iters_per_epoch} iterations/epoch, max {n_epochs} epochs."
     )
 
-    # Ensure weights dir exists for best/last checkpoints
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
     loss_curve = []
@@ -315,21 +290,16 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     best_epoch = 0
     best_state = None
     no_improve = 0
-    # Patience is counted in EPOCHS (one full pass over the training set).
     patience = MLP_PATIENCE
 
     for epoch in range(n_epochs):
         model.train()
         running_loss, n_seen = 0.0, 0
 
-        # GPU memory snapshot (ultralytics-style)
         gpu_mem = (
             torch.cuda.memory_reserved() / 1e9 if DEVICE.type == "cuda" else 0.0
         )
         epoch_label = f"{epoch + 1}/{n_epochs}"
-
-        # Base description (epoch + GPU mem) — training loss is appended live
-        # per mini-batch so it updates on the left side, ultralytics-style.
         base_desc = f"{epoch_label:>10}  {gpu_mem:>7.2f}G"
 
         pbar = tqdm(
@@ -344,7 +314,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             dynamic_ncols=True,
         )
         for xb, yb in pbar:
-            # Normalize lazily and ship to device (overlaps with pinned copies)
             xb = _to_device_normalized(xb, mean, std)
             yb = yb.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
@@ -355,7 +324,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             bs = xb.size(0)
             running_loss += loss.item() * bs
             n_seen += bs
-            # Update loss in the DESCRIPTION (left of bar) every mini-batch
             pbar.set_description(
                 f"{base_desc}  loss={running_loss / n_seen:.4f}"
             )
@@ -364,13 +332,11 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
         loss_curve.append(epoch_loss)
 
         if has_val:
-            # Run validation ONCE per epoch (NOT per iteration — too expensive)
             val_loss, val_acc, val_prec, val_rec = validation_metrics(
                 model, X_val, y_val, mean, std, criterion
             )
             val_scores.append(val_acc)
             val_loss_curve.append(val_loss)
-            # Put val metrics in the postfix (right of bar).
             pbar.set_description(f"{base_desc}  loss={epoch_loss:.4f}")
             pbar.set_postfix(
                 val_loss=f"{val_loss:.4f}",
@@ -380,7 +346,7 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             )
         pbar.close()
 
-        # Save "last" weights after EVERY epoch so they're always current,
+        # Save "last" weights after EVERY epoch so they are always current,
         # even if training is killed/crashes mid-run.
         torch.save(
             {
@@ -391,7 +357,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             os.path.join(WEIGHTS_DIR, "mlp_model_last.pt"),
         )
 
-        # One-line per-epoch summary that persists after the tqdm bar is gone.
         if has_val:
             print(
                 f"  Epoch {epoch + 1}/{n_epochs}  "
@@ -422,7 +387,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             else:
                 no_improve += 1
 
-            # Early stopping (optional)
             if MLP_EARLY_STOPPING and no_improve >= patience:
                 print(
                     f"Early stopping at epoch {epoch + 1} "
@@ -430,11 +394,9 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
                 )
                 break
 
-    # Restore best weights for evaluation (last weights already saved per-epoch).
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Ultralytics-style final summary
     if has_val and val_scores:
         print(
             f"\n{Fore.GREEN}Training complete. "
@@ -444,123 +406,296 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     return model, loss_curve, val_loss_curve, val_scores
 
 
-def extract_features(img_paths, return_paths=False):
-    """Extract single- and double-compressed features for every image.
 
-    Runs sequentially when NUM_FEATURE_WORKERS <= 1, otherwise distributes
-    whole-image extraction across a ProcessPoolExecutor (approach D). Each
-    worker runs the vectorised DCT + Numba histogram pipeline independently.
+# ----------------------------------------------------------------------------
+# Multi-source dataset assembly
+# ----------------------------------------------------------------------------
 
-    Returns (X, y) with X of shape (2*N_ok, N_FEATURES) and y in {0, 1}.
-    When `return_paths` is True, also returns a list `paths` (length 2*N_ok)
-    holding the source image path of each row (added for main.py's patch-based
-    image evaluation, which must map validation rows back to source files).
-    """
-    if ROTATION_AUGMENT:
-        print(
-            "Rotation augmentation: ON "
-            "(random 90-degree multiples via albumentations)"
+def build_dataset_from_sources():
+    """Extract all training samples from the configured source pools."""
+    tasks = build_source_tasks()
+    if not tasks:
+        raise RuntimeError(
+            "No source images found. Check NO_COMPRESS_FOLDERS / "
+            "SINGLE_COMPRESS_FOLDERS / MULTI_COMPRESS_FOLDERS in config.py."
         )
+    by_type = {}
+    for t in tasks:
+        by_type[t["source_type"]] = by_type.get(t["source_type"], 0) + 1
+    print(
+        "Source images: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(by_type.items()))
+        + f" (analysis_qf={ANALYSIS_QF})"
+    )
 
-    X, y, paths = [], [], []
-
+    samples = []
+    t0 = time.time()
     if NUM_FEATURE_WORKERS and NUM_FEATURE_WORKERS > 1:
-        n_workers = NUM_FEATURE_WORKERS
         print(
-            f"Parallel feature extraction with {n_workers} workers "
+            f"Parallel feature extraction with {NUM_FEATURE_WORKERS} workers "
             f"(ProcessPoolExecutor)..."
         )
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(_process_one_image, p): p for p in img_paths
-            }
+        with ProcessPoolExecutor(max_workers=NUM_FEATURE_WORKERS) as pool:
+            futures = [pool.submit(process_source, t) for t in tasks]
             for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
                 desc="Extracting",
                 unit="img",
             ):
-                res = fut.result()
-                if res is None:
-                    continue
-                feats_single, lbl_s, feats_double, lbl_d = res
-                p = futures[fut]
-                X.append(feats_single)
-                y.append(lbl_s)
-                paths.append(p)
-                X.append(feats_double)
-                y.append(lbl_d)
-                paths.append(p)
+                samples.extend(fut.result())
     else:
-        for path in tqdm(img_paths, desc="Extracting", unit="img"):
-            res = _process_one_image(path)
-            if res is None:
-                continue
-            feats_single, lbl_s, feats_double, lbl_d = res
-            X.append(feats_single)
-            y.append(lbl_s)
-            paths.append(path)
-            X.append(feats_double)
-            y.append(lbl_d)
-            paths.append(path)
+        for t in tqdm(tasks, desc="Extracting", unit="img"):
+            samples.extend(process_source(t))
 
-    X = np.asarray(X, dtype=np.float32)
-    y = np.asarray(y, dtype=np.float32)
-    if return_paths:
-        return X, y, paths
+    # Deterministic sample order regardless of worker completion order.
+    samples.sort(key=lambda s: (s["group_id"], s["sample_idx"]))
+    print(f"Extracted {len(samples)} samples in {time.time() - t0:.1f}s")
+    return samples
+
+
+def split_samples(samples):
+    """Group-level split: all samples from one source image stay together.
+
+    Split fractions are applied per source type so every split keeps the same
+    kind composition. Returns {"train": [...], "val": [...], "test": [...]}.
+    """
+    rng = np.random.default_rng(RANDOM_STATE)
+    groups_by_type = {}
+    for s in samples:
+        groups_by_type.setdefault(s["source_type"], set()).add(s["group_id"])
+
+    split_of_group = {}
+    for stype in sorted(groups_by_type):
+        groups = np.array(sorted(groups_by_type[stype]))
+        rng.shuffle(groups)
+        n = len(groups)
+        n_test = max(1, int(round(n * TEST_SIZE))) if n >= 3 else 0
+        n_val = max(1, int(round(n * VAL_SIZE))) if n - n_test >= 2 else 0
+        for g in groups[:n_test]:
+            split_of_group[g] = "test"
+        for g in groups[n_test : n_test + n_val]:
+            split_of_group[g] = "val"
+        for g in groups[n_test + n_val :]:
+            split_of_group[g] = "train"
+
+    splits = {"train": [], "val": [], "test": []}
+    for s in samples:
+        splits[split_of_group[s["group_id"]]].append(s)
+    return splits
+
+
+def stack(samples):
+    """Stack a list of sample dicts into (X, y) arrays."""
+    X = np.stack([s["features"] for s in samples]).astype(np.float32)
+    y = np.array([s["label"] for s in samples], dtype=np.float32)
     return X, y
 
 
+def kind_table(y_true, y_pred, kinds):
+    """Per-sample-kind accuracy rows: (kind, n, accuracy)."""
+    rows = []
+    for kind in sorted(set(kinds)):
+        m = kinds == kind
+        rows.append(
+            [kind, int(m.sum()), round(float((y_true[m] == y_pred[m]).mean()), 4)]
+        )
+    return rows
+
+
+def q_bucket_table(y_true, y_pred, samples):
+    """Accuracy of positive samples bucketed by the first simulated quality.
+
+    For synthetic chains this is q1 of the pair; for derived samples it is the
+    simulated re-save quality (the real first quality is unknown).
+    """
+    kinds = np.array([s["kind"] for s in samples])
+    q_first = np.array([s["q_chain"][0] if s["q_chain"] else -1 for s in samples])
+    rows = []
+    for kind in ("synthetic_multi", "derived_multi"):
+        base = kinds == kind
+        for name, lo, hi in (("q < 75", 0, 74), ("q >= 75", 75, 100)):
+            m = base & (q_first >= lo) & (q_first <= hi)
+            if m.sum():
+                rows.append(
+                    [
+                        kind,
+                        name,
+                        int(m.sum()),
+                        round(float((y_true[m] == y_pred[m]).mean()), 4),
+                    ]
+                )
+    return rows
+
+
+def _img_b64(path):
+    """Read an image file and return it as a base64 data URI (or None)."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as fh:
+        return "data:image/png;base64," + base64.b64encode(fh.read()).decode("ascii")
+
+
+
+# ----------------------------------------------------------------------------
+# Self-contained HTML training report
+# ----------------------------------------------------------------------------
+
+def save_results_html(html_path, run):
+    """Write a self-contained HTML training report (figures embedded base64)."""
+    os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+    css = (
+        "body{font-family:Segoe UI,Arial,sans-serif;max-width:1000px;"
+        "margin:24px auto;padding:0 16px;color:#222}"
+        "h1{border-bottom:3px solid #4a76a8;padding-bottom:6px}"
+        "h2{color:#4a76a8;margin-top:32px}"
+        "table{border-collapse:collapse;margin:12px 0;width:100%}"
+        "th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}"
+        "th{background:#eef3f8}"
+        "td.num{text-align:right}"
+        ".cards{display:flex;gap:12px;flex-wrap:wrap}"
+        ".card{border:1px solid #ccc;border-radius:8px;padding:12px 18px;"
+        "min-width:150px;background:#f8fafc}"
+        ".card b{font-size:1.5em;display:block}"
+        "img{max-width:100%;border:1px solid #ddd;border-radius:6px;margin:6px 0}"
+        "code{background:#f4f4f4;padding:2px 5px;border-radius:4px}"
+        ".muted{color:#777}"
+    )
+
+    def table(headers, rows):
+        h = "".join(f"<th>{c}</th>" for c in headers)
+        body = ""
+        for r in rows:
+            body += "<tr>" + "".join(
+                f'<td class="num">{c}</td>'
+                if isinstance(c, (int, float))
+                else f"<td>{c}</td>"
+                for c in r
+            ) + "</tr>"
+        return f"<table><tr>{h}</tr>{body}</table>"
+
+    def img(path, alt):
+        data = _img_b64(path)
+        return f'<p><img src="{data}" alt="{alt}"></p>' if data else ""
+
+    sections = []
+    sections.append("<h1>Double-compression detector &mdash; training results</h1>")
+    sections.append(
+        f"<p class='muted'>Generated {run['timestamp']} &middot; runtime "
+        f"{run['elapsed_min']:.1f} min &middot; device {run['device']}</p>"
+    )
+    sections.append(
+        "<div class='cards'>"
+        f"<div class='card'>samples<b>{run['n_samples']}</b>total</div>"
+        f"<div class='card'>test accuracy<b>{run['test_acc']:.4f}</b>blind split</div>"
+        f"<div class='card'>test F1 (double)<b>{run['test_f1']:.4f}</b>positive class</div>"
+        f"<div class='card'>ROC AUC<b>{run['roc_auc']:.4f}</b>test</div>"
+        f"<div class='card'>best epoch<b>{run['best_epoch']}</b>of {run['n_epochs_run']}</div>"
+        "</div>"
+    )
+    sections.append("<h2>Dataset composition (samples by kind and split)</h2>")
+    sections.append(
+        table(["kind", "label", "train", "val", "test", "total"], run["comp_rows"])
+    )
+    sections.append("<h2>Training settings</h2>")
+    sections.append(table(["setting", "value"], run["cfg_rows"]))
+    sections.append("<h2>Blind test-set metrics</h2>")
+    sections.append(
+        table(
+            ["class", "precision", "recall", "f1", "support"],
+            run["report_rows"],
+        )
+    )
+    sections.append("<h2>Confusion matrix (test)</h2>")
+    sections.append(table(["", "pred single", "pred double"], run["cm_rows"]))
+    sections.append("<h2>Accuracy by sample kind (test)</h2>")
+    sections.append(table(["kind", "n", "accuracy"], run["kind_rows"]))
+    sections.append(
+        "<h2>Accuracy by simulated-QF bucket (positive samples)</h2>"
+    )
+    sections.append(
+        table(
+            ["kind", "bucket (first simulated q)", "n", "accuracy"],
+            run["q_rows"],
+        )
+    )
+    sections.append("<h2>Figures</h2>")
+    for p, alt in run["figs"]:
+        sections.append(img(p, alt))
+    sections.append("<h2>Artifacts</h2>")
+    sections.append(
+        "<ul>" + "".join(f"<li><code>{a}</code></li>" for a in run["artifacts"]) + "</ul>"
+    )
+    sections.append("<h2>Reproduce</h2>")
+    sections.append(
+        "<pre><code>python src/train_model.py    (from the project root)</code></pre>"
+    )
+
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>Training results - compression detector</title>"
+        f"<style>{css}</style></head><body>"
+        + "".join(sections)
+        + "</body></html>"
+    )
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"Saved HTML report to {html_path}")
+
+
+
 def main():
-    # Discover images directly under DATA_DIR (on-the-fly; no .npy files)
-    img_paths = list_images(DATA_DIR)
-    if MAX_IMAGES and MAX_IMAGES > 0:
-        img_paths = img_paths[:MAX_IMAGES]
-    print(f"Using {len(img_paths)} images from {DATA_DIR}. Extracting features...")
+    t_start = time.time()
 
-    X, y = extract_features(img_paths)
-    print(f"Dataset: {X.shape[0]} samples, {X.shape[1]} features each.")
+    samples = build_dataset_from_sources()
+    if not samples:
+        raise RuntimeError("No samples were generated from the source pools.")
 
-    # Train / test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
-    )
+    splits = split_samples(samples)
+    for name in ("train", "val", "test"):
+        n_pos = sum(1 for s in splits[name] if s["label"] == 1)
+        print(
+            f"{name}: {len(splits[name])} samples "
+            f"({n_pos} positives / {len(splits[name]) - n_pos} negatives)"
+        )
 
-    # Always carve a stratified validation split for per-epoch validation logging
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.1,
-        random_state=RANDOM_STATE, stratify=y_train,
-    )
+    X_tr, y_tr = stack(splits["train"])
+    X_val, y_val = stack(splits["val"]) if splits["val"] else (None, None)
+    X_te, y_te = stack(splits["test"])
 
-    # Convert to tensors
     X_tr_t = torch.from_numpy(X_tr)
     y_tr_t = torch.from_numpy(y_tr)
-    X_test_t = torch.from_numpy(X_test)
-    y_test_t = torch.from_numpy(y_test)
     X_val_t = torch.from_numpy(X_val) if X_val is not None else None
-    y_val_t = torch.from_numpy(y_val) if y_val is not None else None
+    y_val_t = torch.from_numpy(y_val) if X_val is not None else None
+    X_te_t = torch.from_numpy(X_te)
+    y_te_t = torch.from_numpy(y_te)
 
-    # Z-score normalization statistics from TRAINING data only (replaces scaler)
+    # Z-score normalization statistics from TRAINING data only
     mean = X_tr_t.mean(dim=0, keepdim=True)
     std = X_tr_t.std(dim=0, keepdim=True)
-    std = torch.where(std < 1e-6, torch.ones_like(std), std)  # avoid div-by-zero
+    std = torch.where(std < 1e-6, torch.ones_like(std), std)
 
-    # Build model
-    input_dim = X.shape[1]
+    input_dim = X_tr.shape[1]
     model = MLP(input_dim, MLP_HIDDEN_LAYERS).to(DEVICE)
-    print(
-        f"Model: MLP(input={input_dim}, hidden={MLP_HIDDEN_LAYERS}) on {DEVICE}."
-    )
+    print(f"Model: MLP(input={input_dim}, hidden={MLP_HIDDEN_LAYERS}) on {DEVICE}.")
 
-    # Train
     model, loss_curve, val_loss_curve, val_scores = train_loop(
         model, X_tr_t, y_tr_t, X_val_t, y_val_t, mean, std, input_dim
     )
 
-    # Evaluate on held-out test set
-    y_pred, y_proba = evaluate(model, X_test_t, y_test_t, mean, std)
-    print("Classification report:\n", classification_report(y_test, y_pred))
-    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+    # Evaluate on the blind (held-out source groups) test set
+    y_pred, y_proba = evaluate(model, X_te_t, y_te_t, mean, std)
+    print("Classification report:\n", classification_report(y_te, y_pred))
+    cm = confusion_matrix(y_te, y_pred)
+    print("Confusion matrix:\n", cm)
+
+    fpr, tpr, _ = roc_curve(y_te, y_proba)
+    roc_auc = float(auc(fpr, tpr))
+    test_acc = float((y_te == y_pred).mean())
+    rep = classification_report(
+        y_te, y_pred, output_dict=True, target_names=["single (0)", "double (1)"]
+    )
+    test_f1 = float(rep["double (1)"]["f1-score"])
 
     # Save normalization stats (model weights already saved during training)
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
@@ -569,10 +704,110 @@ def main():
         os.path.join(WEIGHTS_DIR, "scaler_stats.pt"),
     )
 
-    # Save diagnostic figures to the assets directory
-    save_all_graphs(ASSETS_DIR, loss_curve, val_scores, y_test, y_pred, y_proba,
-                    val_loss_curve)
-    print(f"Saved best/last weights to '{WEIGHTS_DIR}/' and figures to '{ASSETS_DIR}/'.")
+    # Diagnostic figures
+    save_all_graphs(
+        ASSETS_DIR, loss_curve, val_scores, y_te, y_pred, y_proba, val_loss_curve
+    )
+    print(
+        f"Saved best/last weights to '{WEIGHTS_DIR}/' and figures to '{ASSETS_DIR}/'."
+    )
+
+    # ----- report tables -------------------------------------------------
+    kinds_all = sorted({s["kind"] for s in samples})
+    comp_rows = []
+    for kind in kinds_all:
+        lbl = next(s["label"] for s in samples if s["kind"] == kind)
+        counts = [
+            sum(1 for s in splits[sp] if s["kind"] == kind)
+            for sp in ("train", "val", "test")
+        ]
+        comp_rows.append(
+            [kind, "multi (1)" if lbl else "single (0)"] + counts + [sum(counts)]
+        )
+
+    kinds_te = np.array([s["kind"] for s in splits["test"]])
+    kind_rows = kind_table(y_te, y_pred, kinds_te)
+    q_rows = q_bucket_table(y_te, y_pred, splits["test"])
+
+    report_rows = []
+    for cls in ("single (0)", "double (1)"):
+        r = rep[cls]
+        report_rows.append(
+            [
+                cls,
+                round(float(r["precision"]), 4),
+                round(float(r["recall"]), 4),
+                round(float(r["f1-score"]), 4),
+                int(r["support"]),
+            ]
+        )
+    cm_rows = [
+        ["true single", int(cm[0, 0]), int(cm[0, 1])],
+        ["true double", int(cm[1, 0]), int(cm[1, 1])],
+    ]
+
+    cfg_rows = [
+        ["NO_COMPRESS_FOLDERS", ", ".join(NO_COMPRESS_FOLDERS) or "(none)"],
+        ["SINGLE_COMPRESS_FOLDERS", ", ".join(SINGLE_COMPRESS_FOLDERS) or "(none)"],
+        ["MULTI_COMPRESS_FOLDERS", ", ".join(MULTI_COMPRESS_FOLDERS) or "(none yet)"],
+        ["COMPRESS_Q_RANGE", str(COMPRESS_Q_RANGE)],
+        ["FORCE_DISTINCT_Q", str(FORCE_DISTINCT_Q)],
+        ["TRIPLE_COMPRESS_PROB", str(TRIPLE_COMPRESS_PROB)],
+        ["TRAIN_PATCH_SIZE", str(TRAIN_PATCH_SIZE)],
+        ["ANALYSIS_QF", "raw DCT (None)" if ANALYSIS_QF is None else str(ANALYSIS_QF)],
+        [
+            "source-group split",
+            f"train {1 - TEST_SIZE - VAL_SIZE:.0%} / val {VAL_SIZE:.0%} "
+            f"/ test {TEST_SIZE:.0%}",
+        ],
+        ["MLP hidden layers", str(MLP_HIDDEN_LAYERS)],
+        [
+            "batch / max epochs / patience",
+            f"{BATCH_SIZE} / {MLP_NUM_EPOCHS} / {MLP_PATIENCE}",
+        ],
+        ["learning rate", str(MLP_LEARNING_RATE)],
+        ["feature dim", str(input_dim)],
+    ]
+
+    figs = [
+        (os.path.join(ASSETS_DIR, "loss_curve.png"), "Loss curve"),
+        (os.path.join(ASSETS_DIR, "validation_scores.png"), "Validation accuracy"),
+        (os.path.join(ASSETS_DIR, "confusion_matrix.png"), "Confusion matrix"),
+        (os.path.join(ASSETS_DIR, "roc_curve.png"), "ROC curve"),
+        (
+            os.path.join(ASSETS_DIR, "precision_recall_bar.png"),
+            "Per-class precision/recall/F1",
+        ),
+    ]
+
+    run = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_min": (time.time() - t_start) / 60.0,
+        "device": str(DEVICE),
+        "n_samples": len(samples),
+        "test_acc": test_acc,
+        "test_f1": test_f1,
+        "roc_auc": roc_auc,
+        "best_epoch": int(np.argmin(val_loss_curve)) + 1
+        if val_loss_curve
+        else len(loss_curve),
+        "n_epochs_run": len(loss_curve),
+        "comp_rows": comp_rows,
+        "cfg_rows": cfg_rows,
+        "report_rows": report_rows,
+        "cm_rows": cm_rows,
+        "kind_rows": kind_rows,
+        "q_rows": q_rows,
+        "figs": figs,
+        "artifacts": [
+            os.path.join(WEIGHTS_DIR, "mlp_model_best.pt"),
+            os.path.join(WEIGHTS_DIR, "mlp_model_last.pt"),
+            os.path.join(WEIGHTS_DIR, "scaler_stats.pt"),
+            os.path.join(DOC_DIR, "training_results.html"),
+        ],
+    }
+    save_results_html(os.path.join(DOC_DIR, "training_results.html"), run)
+    print(f"Total runtime: {(time.time() - t_start) / 60.0:.1f} min")
 
 
 if __name__ == "__main__":
