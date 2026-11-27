@@ -231,3 +231,50 @@ The old model was a constant "double" predictor. The bench is exactly the
 hardest class pair (BMP-synthesized singles vs doubles, random q in 30-100
 without the distinct-q rule), and the 0.652 matches the internal blind-test
 estimate for that pair (synthetic_single 0.45 / synthetic_multi 0.85).
+
+## 10. DQ-residue features + detectable re-save chains + threshold calibration (2026-11-27)
+
+Baseline run before this change: blind-test acc 0.8092, F1(double) 0.8280,
+AUC 0.9022, with synthetic_single accuracy stuck at 0.522 (742 test FPs).
+
+Diagnosis (probes in `logs/probe_*.py`): the generator drew q2 uniformly, so
+~50% of doubles were descending re-saves with step ratios >= 3, which are
+statistically near-identical to single compression (between-class DQ
+histogram distance 0.2-0.4x the noise floor). Training on those pairs taught
+the MLP the spurious shortcut "coarse last lattice -> double", which misfires
+on low-quality genuine singles. Ascending re-saves (finer second grid) are
+the strongly detectable regime (2.0x).
+
+Changes:
+
+- `src/config.py`: `SAMPLES_SINGLE_PER_UNCOMPRESSED` 2 -> 3 (synthetic
+  classes now 1:1), new `Q2_ASCEND_SHARE = 0.5`, `Q2_STEP_RATIO_RANGE =
+  (1.2, 2.5)` (follow-up passes draw a step RATIO, applied ascending or
+  descending, so pairs always sit in the detectable band), and
+  `Q2_MAX_QUALITY = 95` (near-lossless passes leave no trace). New feature
+  keys `DQ_HIST_BINS/DQ_HIST_RANGE` and `RES_HIST_BINS/RES_HIST_RANGE`.
+- `src/dataset_sources.py`: `draw_followup_quality` (ratio-based follow-up
+  quality), feature vector 6300 -> 9702 dims: raw histograms + per-position
+  stats (mean/std/zero-ratio/kurtosis) + DQ histograms (coefficients divided
+  by the LAST pass steps -- the classic double-quantisation comb, exact for
+  PIL-synthesised chains, the file's ACTUAL table for real files via new
+  `load_quant_table`) + fractional-part residue histograms.
+- `src/train_model.py`: `calibrate_threshold` sweeps the decision threshold
+  on the VALIDATION split for max F1(double) after training and persists it
+  as `decision_threshold` in both checkpoints; the blind-test evaluation
+  uses it; `q_bucket_table` now reports last-pass ordering (re-save lower vs
+  higher) and last-quality buckets; samples carry `q_prior` (estimated
+  source quality of derived samples).
+- `src/predict.py`: applies the checkpoint's calibrated threshold (falls
+  back to `PATCH_VOTE_THRESHOLD` for legacy checkpoints).
+
+Result (same trainer, MLP, split; `doc/training_results.html`,
+`logs/train_v5.log`): blind-test **acc 0.8859, F1(double) 0.8816, AUC
+0.9542** (threshold 0.520). Per kind: synthetic_single 0.804 (was 0.522),
+synthetic_multi 0.880 (ascending re-saves 0.974), derived_multi 0.874,
+real_single 0.999, real_multi 0.971, uncompressed 1.000. Remaining known
+hard regime: descending re-saves (0.78-0.86) -- moderate step ratios are
+detectable but weak; much-coarser re-saves and aligned (integer-ratio)
+double compression remain near-undetectable by design. Baseline report and
+weights preserved in `doc/training_results_baseline.html`,
+`doc/training_results_v4.html`, and `weights_baseline/`.

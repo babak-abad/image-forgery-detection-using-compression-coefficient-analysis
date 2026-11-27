@@ -9,9 +9,16 @@ Multi-source dataset (see dataset_sources.py):
 
 A sample's label is 1 (multi-compressed) iff (source prior compressions +
 applied rounds) >= 2. Every simulated compression round is a REAL JPEG
-encode/decode at a fresh random quality from COMPRESS_Q_RANGE, consecutive
-rounds use distinct quality factors, and derived rounds avoid the source
-file's estimated quality.
+encode/decode. The first pass on pristine pixels draws a uniform quality from
+COMPRESS_Q_RANGE; follow-up passes (and derived first passes) are drawn so
+the double-quantisation comb is detectable -- a Q2_ASCEND_SHARE share of
+finer re-saves (strong comb) and the rest descending within the
+Q2_STEP_RATIO_RANGE band (still-detectable; much-coarser second grids are
+statistically near-identical to single compression).
+
+After training, the binary decision threshold is calibrated on the VALIDATION
+split (max F1 of the double class) and persisted into both checkpoints; the
+blind-test evaluation and predict.py then use that calibrated threshold.
 
 The train/val/test split is at SOURCE-IMAGE level (70/10/20 by default): all
 samples generated from one source image stay together, so no pixel content
@@ -69,8 +76,21 @@ from config import (
     MULTI_COMPRESS_FOLDERS,
     COMPRESS_Q_RANGE,
     FORCE_DISTINCT_Q,
+    Q2_ASCEND_SHARE,
+    Q2_STEP_RATIO_RANGE,
     TRIPLE_COMPRESS_PROB,
     TRAIN_PATCH_SIZE,
+    DQ_HIST_BINS,
+    DQ_HIST_RANGE,
+    RES_HIST_BINS,
+    RES_HIST_RANGE,
+    N_HIST_BINS,
+    N_AC_COEFFS,
+    SAMPLES_UNCOMPRESSED_PER_UNCOMPRESSED,
+    SAMPLES_SINGLE_PER_UNCOMPRESSED,
+    SAMPLES_DOUBLE_PER_UNCOMPRESSED,
+    SAMPLES_ORIGINAL_PER_COMPRESSED,
+    SAMPLES_DOUBLE_PER_COMPRESSED,
 )
 from dataset_sources import build_source_tasks, process_source
 
@@ -203,19 +223,46 @@ def _to_device_normalized(X_chunk, mean, std):
 
 
 @torch.no_grad()
-def evaluate(model, X, y, mean, std, device=DEVICE, batch_size=512):
-    """Return (predictions, probabilities) for evaluation tensors X, y."""
+def evaluate(model, X, y, mean, std, device=DEVICE, batch_size=512, threshold=0.5):
+    """Return (predictions, probabilities) for evaluation tensors X, y.
+
+    Predictions cut the sigmoid probability at `threshold` (0.5 default;
+    main() passes the validation-calibrated threshold).
+    """
     model.eval()
     preds, probs = [], []
     for i in range(0, X.shape[0], batch_size):
-        xb = _to_device_normalized(X[i:i + batch_size], mean, std)
+        xb = _to_device_normalized(X_chunk=X[i:i + batch_size], mean=mean, std=std)
         logits = model(xb).cpu()
         p = torch.sigmoid(logits)
-        preds.append((p >= 0.5).long())
+        preds.append((p >= threshold).long())
         probs.append(p)
     preds = torch.cat(preds).numpy()
     probs = torch.cat(probs).numpy()
     return preds, probs
+
+
+def calibrate_threshold(y_true, proba, n_grid=199):
+    """Sweep decision thresholds on VALIDATION probabilities; maximise F1(double).
+
+    Returns (best_threshold, best_f1). The grid covers (0, 1) with `n_grid`
+    points and always contains 0.5, so the default cut is a candidate.
+    Calibration reads the validation split only; the test split stays blind.
+    """
+    y = np.asarray(y_true, dtype=np.int64)
+    p = np.asarray(proba, dtype=np.float64)
+    best_t, best_f1 = 0.5, -1.0
+    for t in np.linspace(0.01, 0.99, n_grid):
+        pred = (p >= t).astype(np.int64)
+        tp = int(np.sum((pred == 1) & (y == 1)))
+        fp = int(np.sum((pred == 1) & (y == 0)))
+        fn = int(np.sum((pred == 0) & (y == 1)))
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        if f1 > best_f1:
+            best_f1, best_t = float(f1), float(t)
+    return best_t, best_f1
 
 
 @torch.no_grad()
@@ -531,19 +578,46 @@ def kind_table(y_true, y_pred, kinds):
     return rows
 
 
-def q_bucket_table(y_true, y_pred, samples):
-    """Accuracy of positive samples bucketed by the first simulated quality.
+def _chain_order_label(sample):
+    """Ordering of the last applied pass vs the previous compression.
 
-    For synthetic chains this is q1 of the pair; for derived samples it is the
-    simulated re-save quality (the real first quality is unknown).
+    'last < prev' = descending re-save (strong double-quantisation comb),
+    'last > prev' = ascending re-save (the hard, weak-comb regime), 'unknown'
+    when the previous quality is unavailable (e.g. estimate_qf failed).
+    """
+    chain = sample.get("q_chain") or []
+    q_last = chain[-1] if chain else None
+    q_prev = chain[-2] if len(chain) >= 2 else sample.get("q_prior")
+    if q_last is None or q_prev is None:
+        return "unknown"
+    if q_last < q_prev:
+        return "last < prev"
+    return "last > prev"
+
+
+def q_bucket_table(y_true, y_pred, samples):
+    """Accuracy of positive samples bucketed by chain structure.
+
+    Rows per positive kind: the ordering of the last pass vs the previous
+    compression (descending re-saves are the realistic, strongly detectable
+    regime; ascending ones are the hard regime) and the last-pass quality
+    bucket (a high final quality weakens the comb artefacts).
     """
     kinds = np.array([s["kind"] for s in samples])
-    q_first = np.array([s["q_chain"][0] if s["q_chain"] else -1 for s in samples])
+    order = np.array([_chain_order_label(s) for s in samples])
+    q_last = np.array([s["q_chain"][-1] if s["q_chain"] else -1 for s in samples])
     rows = []
     for kind in ("synthetic_multi", "derived_multi"):
         base = kinds == kind
-        for name, lo, hi in (("q < 75", 0, 74), ("q >= 75", 75, 100)):
-            m = base & (q_first >= lo) & (q_first <= hi)
+        if not base.any():
+            continue
+        for name, m in (
+            ("re-save lower (q_last < q_prev)", base & (order == "last < prev")),
+            ("re-save higher (q_last > q_prev)", base & (order == "last > prev")),
+            ("prev quality unknown", base & (order == "unknown")),
+            ("last q < 75", base & (q_last >= 0) & (q_last < 75)),
+            ("last q >= 75", base & (q_last >= 75)),
+        ):
             if m.sum():
                 rows.append(
                     [
@@ -618,6 +692,7 @@ def save_results_html(html_path, run):
         f"<div class='card'>test accuracy<b>{run['test_acc']:.4f}</b>blind split</div>"
         f"<div class='card'>test F1 (double)<b>{run['test_f1']:.4f}</b>positive class</div>"
         f"<div class='card'>ROC AUC<b>{run['roc_auc']:.4f}</b>test</div>"
+        f"<div class='card'>threshold<b>{run['decision_threshold']:.2f}</b>val-calibrated</div>"
         f"<div class='card'>best epoch<b>{run['best_epoch']}</b>of {run['n_epochs_run']}</div>"
         "</div>"
     )
@@ -643,7 +718,7 @@ def save_results_html(html_path, run):
     )
     sections.append(
         table(
-            ["kind", "bucket (first simulated q)", "n", "accuracy"],
+            ["kind", "bucket (last-pass ordering / quality)", "n", "accuracy"],
             run["q_rows"],
         )
     )
@@ -711,8 +786,23 @@ def main():
         model, X_tr_t, y_tr_t, X_val_t, y_val_t, mean, std, input_dim
     )
 
-    # Evaluate on the blind (held-out source groups) test set
-    y_pred, y_proba = evaluate(model, X_te_t, y_te_t, mean, std)
+    # Calibrate the decision threshold on the VALIDATION split (never on
+    # test): sweep thresholds for the best F1 of the double class.
+    if X_val_t is not None:
+        _, proba_val = evaluate(model=model, X=X_val_t, y=y_val_t, mean=mean, std=std)
+        decision_threshold, val_f1 = calibrate_threshold(y_true=y_val, proba=proba_val)
+        print(
+            f"Calibrated decision threshold on validation: "
+            f"{decision_threshold:.3f} (val F1(double)={val_f1:.4f}; default 0.5)"
+        )
+    else:
+        decision_threshold = 0.5
+
+    # Evaluate on the blind (held-out source groups) test set with the
+    # calibrated threshold.
+    y_pred, y_proba = evaluate(
+        model=model, X=X_te_t, y=y_te_t, mean=mean, std=std, threshold=decision_threshold
+    )
     print("Classification report:\n", classification_report(y_te, y_pred))
     cm = confusion_matrix(y_te, y_pred)
     print("Confusion matrix:\n", cm)
@@ -731,6 +821,15 @@ def main():
         {"mean": mean.cpu(), "std": std.cpu()},
         os.path.join(WEIGHTS_DIR, "scaler_stats.pt"),
     )
+
+    # Persist the calibrated threshold in both checkpoints so predict.py
+    # applies the same decision cut as this evaluation.
+    for ckpt_name in ("mlp_model_best.pt", "mlp_model_last.pt"):
+        ckpt_path = os.path.join(WEIGHTS_DIR, ckpt_name)
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            ckpt["decision_threshold"] = decision_threshold
+            torch.save(ckpt, ckpt_path)
 
     # Diagnostic figures
     save_all_graphs(
@@ -780,9 +879,25 @@ def main():
         ["MULTI_COMPRESS_FOLDERS", ", ".join(MULTI_COMPRESS_FOLDERS) or "(none yet)"],
         ["COMPRESS_Q_RANGE", str(COMPRESS_Q_RANGE)],
         ["FORCE_DISTINCT_Q", str(FORCE_DISTINCT_Q)],
+        ["Q2_ASCEND_SHARE / Q2_STEP_RATIO_RANGE", f"{Q2_ASCEND_SHARE} / {Q2_STEP_RATIO_RANGE}"],
         ["TRIPLE_COMPRESS_PROB", str(TRIPLE_COMPRESS_PROB)],
+        [
+            "samples per source image",
+            f"uncompressed: 1 + {SAMPLES_SINGLE_PER_UNCOMPRESSED} single + "
+            f"{SAMPLES_DOUBLE_PER_UNCOMPRESSED} double; compressed: "
+            f"{SAMPLES_ORIGINAL_PER_COMPRESSED} original + "
+            f"{SAMPLES_DOUBLE_PER_COMPRESSED} derived",
+        ],
         ["TRAIN_PATCH_SIZE", str(TRAIN_PATCH_SIZE)],
+        ["decision threshold (val-calibrated)", f"{decision_threshold:.3f}"],
         ["ANALYSIS_QF", "raw DCT (None)" if ANALYSIS_QF is None else str(ANALYSIS_QF)],
+        [
+            "feature set",
+            f"raw hist {N_AC_COEFFS}x{N_HIST_BINS} + per-position stats 4x"
+            f"{N_AC_COEFFS} + DQ hist {N_AC_COEFFS}x{DQ_HIST_BINS} over "
+            f"{DQ_HIST_RANGE} + residue hist {N_AC_COEFFS}x{RES_HIST_BINS} "
+            f"over {RES_HIST_RANGE}",
+        ],
         [
             "source-group split",
             f"train {1 - TEST_SIZE - VAL_SIZE:.0%} / val {VAL_SIZE:.0%} "
@@ -816,6 +931,7 @@ def main():
         "test_acc": test_acc,
         "test_f1": test_f1,
         "roc_auc": roc_auc,
+        "decision_threshold": decision_threshold,
         "best_epoch": int(np.argmin(val_loss_curve)) + 1
         if val_loss_curve
         else len(loss_curve),

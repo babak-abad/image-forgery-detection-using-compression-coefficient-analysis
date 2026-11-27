@@ -77,6 +77,33 @@ N_HIST_BINS = 100
 #   e.g. size 4 -> 15, size 8 -> 63, size 16 -> 255. Current (size 8): 63.
 N_AC_COEFFS = 63
 
+# DQ-residue histogram features (dataset_sources.features_from_pixels):
+# per-AC-position histograms of raw DCT coefficients divided by the table of
+# the LAST JPEG pass quality (known from the synthesis chain at training,
+# estimated from the file's quantization table at inference). For a
+# single-compressed image these values concentrate at integers; a prior
+# coarser pass leaves a periodic comb (classic double-quantisation residue).
+# Never-compressed inputs (no table) produce a zero block instead.
+# Range: positive integer. 40 bins over a +-10 range -> 0.5-wide bins, so the
+# integer lattice and combs with period >= 1 are resolved.
+DQ_HIST_BINS = 40
+
+# Inclusive range of the DQ-residue histograms (in units of quantised steps).
+DQ_HIST_RANGE = (-10.0, 10.0)
+
+# DQ-residue fractional-part histograms: per-AC-position histograms of
+# (v / last-pass step) - round(v / last-pass step), i.e. the position of each
+# coefficient between the lattice points of its LAST quantisation. A
+# single-compressed image concentrates the fraction at 0 (a spike); any
+# earlier pass at a different quality spreads it periodically over [-0.5,
+# 0.5]. Unlike coefficient magnitude features, this signature is
+# quality-invariant, so low-quality singles are no longer confused with
+# doubles. Bins of width 0.1 resolve the spike and the comb.
+RES_HIST_BINS = 10
+
+# Inclusive range of the fractional-part histograms (always (-0.5, 0.5)).
+RES_HIST_RANGE = (-0.5, 0.5)
+
 # ----------------------------------------------------------------------------
 # Model / training settings
 # ----------------------------------------------------------------------------
@@ -198,6 +225,30 @@ COMPRESS_Q_RANGE = (30, 100)
 # because re-compression at the SAME quality is nearly undetectable.
 FORCE_DISTINCT_Q = True
 
+# Realistic/DETECTABLE re-save ordering for follow-up compression passes.
+# DQ theory (and our probes) show the double-quantisation comb is STRONG only
+# when the consecutive step ratio is moderate: an ascending re-save (finer
+# second grid, ratio 2x) separates single vs double histograms at ~2x the
+# noise floor, while a much-coarser second grid (ratio >= ~3) is nearly
+# invisible (0.2-0.4x) and only poisons training labels. Follow-up passes
+# therefore draw a step RATIO from Q2_STEP_RATIO_RANGE and apply it either
+# direction: Q2_ASCEND_SHARE of passes make the grid FINER (strong comb),
+# the rest coarser (realistic downward re-save, e.g. WhatsApp ~2.5).
+# Range: float 0.0-1.0. 0.0 = always descending; 1.0 = always ascending.
+Q2_ASCEND_SHARE = 0.5
+
+# Step-ratio band (libjpeg scale of pass i+1 / scale of pass i, or its
+# inverse for ascending draws) for follow-up passes. Applied in both
+# directions so pairs always sit in the detectable band.
+# Range: two floats, 1.0 < min <= max <= 4.0.
+Q2_STEP_RATIO_RANGE = (1.2, 2.5)
+
+# Hard cap on simulated pass qualities: libjpeg quality above ~95 is
+# near-lossless (steps of 1-6), so a pass at 96-100 leaves almost no
+# double-compression trace and would label near-single samples as doubles.
+# Range: integer 80-100.
+Q2_MAX_QUALITY = 95
+
 # Probability that a generated multi-compressed sample receives one extra
 # pass (BMP chains: 3 passes instead of 2; derived: 2 passes instead of 1).
 TRIPLE_COMPRESS_PROB = 0.25
@@ -205,9 +256,10 @@ TRIPLE_COMPRESS_PROB = 0.25
 # Side length (pixels, multiple of BLOCK_SIZE) of the random training patch.
 TRAIN_PATCH_SIZE = 256
 
-# Samples generated per never-compressed source image.
+# Samples generated per never-compressed source image. Synthetic singles and
+# doubles are generated 1:1 (3 vs 3) so neither class dominates the pool.
 SAMPLES_UNCOMPRESSED_PER_UNCOMPRESSED = 1
-SAMPLES_SINGLE_PER_UNCOMPRESSED = 2
+SAMPLES_SINGLE_PER_UNCOMPRESSED = 3
 SAMPLES_DOUBLE_PER_UNCOMPRESSED = 3
 
 # Samples per already-compressed source image: originals as-is (label from

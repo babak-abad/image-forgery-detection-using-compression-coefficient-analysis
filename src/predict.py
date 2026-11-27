@@ -5,7 +5,9 @@ Loads the PyTorch MLP (`mlp_model_best.pt`, falling back to `mlp_model_last.pt`)
 and its normalization stats (`scaler_stats.pt`) saved by `train_model.py`, and
 applies them to a RAW DCT AC-histogram feature vector extracted from the whole
 image (features_for_file in dataset_sources.py, ANALYSIS_QF = None) - exactly
-the feature path used at training time, with no assumed quality factor.
+the feature path used at training time, with no assumed quality factor. The
+decision cut is the validation-calibrated threshold stored in the checkpoint
+(falls back to PATCH_VOTE_THRESHOLD for legacy checkpoints without one).
 """
 import os
 import numpy as np
@@ -67,6 +69,11 @@ def predict_image(img_path):
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
+    # Decision threshold calibrated on the validation split at training time;
+    # falls back to PATCH_VOTE_THRESHOLD for checkpoints from before
+    # threshold calibration existed.
+    threshold = float(ckpt.get("decision_threshold", PATCH_VOTE_THRESHOLD))
+
     # Load normalization stats (mean, std over training set)
     stats = torch.load(
         os.path.join(WEIGHTS_DIR, "scaler_stats.pt"),
@@ -85,11 +92,14 @@ def predict_image(img_path):
         logit = model(x.unsqueeze(0))
         p_double = torch.sigmoid(logit).item()
 
-    pred = 1 if p_double >= PATCH_VOTE_THRESHOLD else 0
+    pred = 1 if p_double >= threshold else 0
     proba = np.array([1.0 - p_double, p_double], dtype=np.float32)
 
     label = "single-compressed" if pred == 0 else "multi-compressed"
-    print(f"Prediction: {label}  (confidence: {max(proba):.3f})")
+    print(
+        f"Prediction: {label}  (confidence: {max(proba):.3f}, "
+        f"threshold: {threshold:.3f})"
+    )
     return pred, proba
 
 
