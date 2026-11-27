@@ -87,6 +87,13 @@ print(f"PyTorch is running on {DEVICE.type.upper()} ({_dev_name})")
 torch.backends.cudnn.deterministic = True   # reproducible kernels
 torch.backends.cudnn.benchmark = True       # autotune for fixed input size
 
+# YOLO (ultralytics)-style console progress for the training loop, built on
+# tqdm: 11-char right-aligned columns and the bar_format constant used by
+# ultralytics itself. No ultralytics dependency is introduced.
+TQDM_BAR_FORMAT = "{l_bar}{bar:10}{r_bar}"
+TRAIN_COLUMNS = ("Epoch", "GPU_mem", "bce_loss", "Samples", "Feat_dim")
+VAL_METRIC_COLUMNS = ("val_loss", "val_acc", "prec", "recall")
+
 
 class MLP(nn.Module):
     """Simple feed-forward binary classifier matching MLP_HIDDEN_LAYERS."""
@@ -222,11 +229,35 @@ def validation_accuracy(model, X_val, y_val, mean, std, device=DEVICE):
 
 
 @torch.no_grad()
-def validation_metrics(model, X_val, y_val, mean, std, criterion):
-    """Return (val_loss, val_acc, precision, recall) on the validation set."""
+def validation_metrics(
+    model, X_val, y_val, mean, std, criterion, batch_size=512, progress=True
+):
+    """Return (val_loss, val_acc, precision, recall) on the validation set.
+
+    The forward pass runs in `batch_size` chunks so a YOLO-style validation
+    progress line (tqdm) can be shown; results are identical to a single
+    full-batch pass because the chunk logits are concatenated before scoring.
+    """
     model.eval()
-    xb = _to_device_normalized(X_val, mean, std)
-    logits = model(xb).cpu()
+    chunks = range(0, X_val.shape[0], batch_size)
+    pbar = (
+        tqdm(
+            chunks,
+            desc=" " * 11 + "".join(f"{c:>11}" for c in VAL_METRIC_COLUMNS),
+            bar_format=TQDM_BAR_FORMAT,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        if progress
+        else chunks
+    )
+    logits_parts = []
+    for start in pbar:
+        xb = _to_device_normalized(
+            X_chunk=X_val[start:start + batch_size], mean=mean, std=std
+        )
+        logits_parts.append(model(xb).cpu())
+    logits = torch.cat(logits_parts)
     val_loss = criterion(logits, y_val).item()
     preds = (torch.sigmoid(logits) >= 0.5).long()
     y_true = y_val.long()
@@ -237,6 +268,11 @@ def validation_metrics(model, X_val, y_val, mean, std, criterion):
     fn = ((preds == 0) & (y_true == 1)).sum().item()
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    if progress:
+        print(
+            f"{'all':>11}"
+            + "".join(f"{v:>11.4f}" for v in (val_loss, val_acc, precision, recall))
+        )
     return val_loss, val_acc, precision, recall
 
 
@@ -250,6 +286,10 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
 
     Data stays on the CPU (normalized lazily per batch); worker processes
     prefetch batches and pin them so GPU transfer overlaps with compute.
+
+    Progress is rendered YOLO-style: a one-time column header, one live
+    tqdm line per epoch (running-mean loss, GPU memory) that stays in the
+    scrollback when complete, plus a validation progress line and metrics row.
     """
     if DEVICE.type == "cuda":
         torch.cuda.empty_cache()
@@ -271,15 +311,13 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     n_epochs = MLP_NUM_EPOCHS
     has_val = X_val is not None
 
-    header = f"{Fore.CYAN}{'Epoch':>10}  {'GPU_mem':>8}  {'train_loss':>12}"
-    if has_val:
-        header += f"  {'val_loss':>10}  {'val_acc':>8}  {'precision':>10}  {'recall':>8}"
-    header += f"{Style.RESET_ALL}"
-    print(header)
     print(
-        f"Training: {len(ds)} samples, BATCH_SIZE={BATCH_SIZE} -> "
-        f"{iters_per_epoch} iterations/epoch, max {n_epochs} epochs."
+        f"Starting training for {n_epochs} epochs ({len(ds)} samples, "
+        f"BATCH_SIZE={BATCH_SIZE} -> {iters_per_epoch} iterations/epoch)..."
     )
+    print()
+    header = f"{Fore.CYAN}" + "".join(f"{c:>11}" for c in TRAIN_COLUMNS) + f"{Style.RESET_ALL}"
+    print(header)
 
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
@@ -295,26 +333,18 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
     for epoch in range(n_epochs):
         model.train()
         running_loss, n_seen = 0.0, 0
-
-        gpu_mem = (
-            torch.cuda.memory_reserved() / 1e9 if DEVICE.type == "cuda" else 0.0
-        )
         epoch_label = f"{epoch + 1}/{n_epochs}"
-        base_desc = f"{epoch_label:>10}  {gpu_mem:>7.2f}G"
 
         pbar = tqdm(
             loader,
-            desc=f"{base_desc}  loss=0.0000",
-            bar_format=(
-                "{desc}: {percentage:3.0f}%|{bar:20}| "
-                "{n_fmt}/{total_fmt} [{rate_fmt} {postfix}]"
-            ),
-            unit="batch",
+            total=iters_per_epoch,
+            desc=f"{epoch_label:>11}" + " " * 44,
+            bar_format=TQDM_BAR_FORMAT,
             leave=True,
             dynamic_ncols=True,
         )
         for xb, yb in pbar:
-            xb = _to_device_normalized(xb, mean, std)
+            xb = _to_device_normalized(X_chunk=xb, mean=mean, std=std)
             yb = yb.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
             logits = model(xb)
@@ -324,27 +354,34 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             bs = xb.size(0)
             running_loss += loss.item() * bs
             n_seen += bs
-            pbar.set_description(
-                f"{base_desc}  loss={running_loss / n_seen:.4f}"
+            gpu_mem = (
+                f"{torch.cuda.memory_reserved() / 1e9:.3g}G"
+                if DEVICE.type == "cuda"
+                else "0G"
             )
+            pbar.set_description(
+                f"{epoch_label:>11}"
+                f"{gpu_mem:>11}"
+                f"{running_loss / n_seen:>11.4f}"
+                f"{n_seen:>11}"
+                f"{input_dim:>11}"
+            )
+        pbar.close()
 
         epoch_loss = running_loss / max(n_seen, 1)
         loss_curve.append(epoch_loss)
 
         if has_val:
             val_loss, val_acc, val_prec, val_rec = validation_metrics(
-                model, X_val, y_val, mean, std, criterion
+                model=model,
+                X_val=X_val,
+                y_val=y_val,
+                mean=mean,
+                std=std,
+                criterion=criterion,
             )
             val_scores.append(val_acc)
             val_loss_curve.append(val_loss)
-            pbar.set_description(f"{base_desc}  loss={epoch_loss:.4f}")
-            pbar.set_postfix(
-                val_loss=f"{val_loss:.4f}",
-                val_acc=f"{val_acc:.4f}",
-                prec=f"{val_prec:.4f}",
-                rec=f"{val_rec:.4f}",
-            )
-        pbar.close()
 
         # Save "last" weights after EVERY epoch so they are always current,
         # even if training is killed/crashes mid-run.
@@ -356,15 +393,6 @@ def train_loop(model, X_tr, y_tr, X_val, y_val, mean, std, input_dim):
             },
             os.path.join(WEIGHTS_DIR, "mlp_model_last.pt"),
         )
-
-        if has_val:
-            print(
-                f"  Epoch {epoch + 1}/{n_epochs}  "
-                f"train_loss={epoch_loss:.4f}  val_loss={val_loss:.4f}  "
-                f"val_acc={val_acc:.4f}  prec={val_prec:.4f}  rec={val_rec:.4f}"
-            )
-        else:
-            print(f"  Epoch {epoch + 1}/{n_epochs}  train_loss={epoch_loss:.4f}")
 
         if has_val:
             # Track best weights by LOWEST VALIDATION LOSS and save best.pt.
